@@ -30,6 +30,15 @@ KNOWN_FUNCTION_CODES = READ_FUNCTION_CODES | WRITE_FUNCTION_CODES
 
 MBAP_HEADER_LEN = 7
 
+# Dosing PLC writable registers and their allowed raw values (see
+# plant-spec/register-map.md). Registers 0-1 are read-only sensors.
+# The pH setpoint bounds (6.00-9.00) are a safe operating assumption.
+WRITABLE_REGISTER_RANGES: dict[int, tuple[int, int]] = {
+    2: (0, 100),  # pump_speed (%)
+    3: (600, 900),  # ph_setpoint (x100)
+    4: (0, 1),  # pump_state
+}
+
 
 def parse_modbus_function_code(payload: bytes) -> int | None:
     """Extract the Modbus function code from a raw Modbus/TCP ADU, or None if
@@ -94,6 +103,45 @@ def _check_recon(src_ip: str, function_code: int, address: int | None, now: floa
         )
 
 
+def parse_write_values(function_code: int, payload: bytes) -> list[tuple[int, int]]:
+    """Return (address, raw_value) pairs for a write request; [] if malformed."""
+    body = payload[MBAP_HEADER_LEN + 1 :]
+    if function_code == 0x06:
+        if len(body) < 4:
+            return []
+        return [(int.from_bytes(body[0:2], "big"), int.from_bytes(body[2:4], "big"))]
+    if function_code == 0x10:
+        if len(body) < 5:
+            return []
+        start = int.from_bytes(body[0:2], "big")
+        qty = int.from_bytes(body[2:4], "big")
+        data = body[5:]
+        if len(data) < qty * 2:
+            return []
+        return [(start + i, int.from_bytes(data[2 * i : 2 * i + 2], "big")) for i in range(qty)]
+    return []
+
+
+def _check_write_values(src_ip: str, function_code: int, payload: bytes) -> None:
+    for address, value in parse_write_values(function_code, payload):
+        bounds = WRITABLE_REGISTER_RANGES.get(address)
+        if bounds is None:
+            reason = f"write to non-writable register {address}"
+        elif not bounds[0] <= value <= bounds[1]:
+            reason = f"out-of-range value {value} for register {address} (allowed {bounds[0]}-{bounds[1]})"
+        else:
+            continue
+        alert_store.add(
+            source="rule_ids",
+            severity="critical",
+            message=f"{reason} from {src_ip}",
+            src_ip=src_ip,
+            function_code=function_code,
+            address=address,
+            value=value,
+        )
+
+
 def inspect_packet(packet: Packet, now: float | None = None) -> None:
     if not packet.haslayer(IP) or not packet.haslayer(TCP) or not packet.haslayer(Raw):
         return
@@ -124,6 +172,9 @@ def inspect_packet(packet: Packet, now: float | None = None) -> None:
             function_code=function_code,
         )
         return
+
+    if function_code in WRITE_FUNCTION_CODES:
+        _check_write_values(src_ip, function_code, payload)
 
     if function_code in WRITE_FUNCTION_CODES and src_ip not in AUTHORIZED_WRITE_SOURCES:
         alert_store.add(

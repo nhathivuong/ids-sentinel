@@ -111,3 +111,50 @@ def test_plc_responses_are_ignored():
     pkt = IP(src="10.10.0.12", dst="10.10.0.20") / TCP(sport=502, dport=51000) / Raw(load=mbap + b"\x06\x00\x00\x00\x01")
     inspect_packet(pkt)
     assert alert_store.list() == []
+
+
+def make_write(src_ip: str, address: int, value: int):
+    mbap = b"\x00\x01\x00\x00\x00\x06\x01"
+    payload = mbap + b"\x06" + address.to_bytes(2, "big") + value.to_bytes(2, "big")
+    return IP(src=src_ip, dst="10.10.0.12") / TCP(sport=51000, dport=502) / Raw(load=payload)
+
+
+def make_write_multiple(src_ip: str, address: int, values: list[int]):
+    body = address.to_bytes(2, "big") + len(values).to_bytes(2, "big") + bytes([2 * len(values)])
+    body += b"".join(v.to_bytes(2, "big") for v in values)
+    mbap = b"\x00\x01\x00\x00\x00\x09\x01"
+    return IP(src=src_ip, dst="10.10.0.12") / TCP(sport=51000, dport=502) / Raw(load=mbap + b"\x10" + body)
+
+
+def test_valid_authorized_write_is_silent():
+    inspect_packet(make_write("10.10.0.20", 2, 50))
+    inspect_packet(make_write("10.10.0.20", 3, 740))
+    assert alert_store.list() == []
+
+
+def test_out_of_range_value_from_authorized_source_is_critical():
+    inspect_packet(make_write("10.10.0.20", 2, 500))
+
+    alerts = alert_store.list()
+    assert len(alerts) == 1
+    assert alerts[0]["severity"] == "critical"
+    assert alerts[0]["details"]["address"] == 2
+    assert alerts[0]["details"]["value"] == 500
+
+
+def test_dangerous_ph_setpoint_is_flagged():
+    inspect_packet(make_write("10.10.0.20", 3, 200))
+    assert any("out-of-range" in a["message"] for a in alert_store.list())
+
+
+def test_write_to_read_only_register_is_flagged():
+    inspect_packet(make_write("10.10.0.20", 0, 700))
+    assert any("non-writable register 0" in a["message"] for a in alert_store.list())
+
+
+def test_write_multiple_checks_each_register():
+    inspect_packet(make_write_multiple("10.10.0.20", 2, [50, 740, 5]))
+
+    alerts = alert_store.list()
+    assert len(alerts) == 1
+    assert alerts[0]["details"]["address"] == 4
